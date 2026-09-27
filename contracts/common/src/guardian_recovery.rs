@@ -3,6 +3,7 @@
 //! Also provides admin-gated pause/unpause controls for critical contracts (#1018).
 //! Also provides deposit retry protection for failed ledger writes (#1029).
 //! Also provides a shared append-only emergency action journal (#1166).
+//! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Also provides scoped operator capabilities for contract maintenance actions (#1182).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
@@ -64,6 +65,134 @@ impl RecoveryRequest {
         if self.approvals.len() < self.required_approvals {
             return Err(RecoveryError::InsufficientApprovals);
         }
+        Ok(())
+    }
+}
+
+/// Errors surfaced by the delayed guardian recovery path (#1183).
+#[derive(Debug, PartialEq, Eq)]
+pub enum GuardianRecoveryError {
+    /// Caller is not authorized for this recovery action.
+    Unauthorized,
+    /// The configured guardian threshold is not met.
+    InsufficientApprovals,
+    /// The configured delay has not yet elapsed since initiation.
+    DelayNotElapsed,
+    /// The recovery has already been executed.
+    AlreadyExecuted,
+    /// The recovery was cancelled by the active administrator.
+    Cancelled,
+    /// The configured threshold or delay is invalid (e.g. zero threshold).
+    InvalidConfig,
+}
+
+/// Delayed, auditable recovery flow for restoring administrator access when the
+/// active administrator key is unavailable (#1183).
+///
+/// A recovery is initiated by a guardian, gathers approvals until the configured
+/// guardian threshold is met, and can only be executed once the configured delay
+/// has elapsed since initiation. The active administrator may cancel a pending
+/// recovery at any point during the delay window.
+#[derive(Clone)]
+#[contracttype]
+pub struct GuardianRecovery {
+    /// The currently active administrator, who may cancel a pending recovery.
+    pub active_admin: Address,
+    /// Minimum number of distinct guardian approvals required to execute.
+    pub threshold: u32,
+    /// Delay (in ledgers) that must elapse between initiation and execution.
+    pub delay: u32,
+    /// Ledger sequence at which the recovery was initiated.
+    pub initiated_at: u32,
+    /// Distinct guardian approvals gathered so far.
+    pub approvals: Vec<Address>,
+    /// Whether the recovery has been executed.
+    pub executed: bool,
+    /// Whether the recovery was cancelled by the active administrator.
+    pub cancelled: bool,
+}
+
+impl GuardianRecovery {
+    /// Creates a new pending recovery. Rejects a zero threshold or zero delay so
+    /// a misconfigured recovery cannot bypass the guardian gate or the delay.
+    pub fn new(
+        active_admin: Address,
+        threshold: u32,
+        delay: u32,
+        env: &Env,
+    ) -> Result<Self, GuardianRecoveryError> {
+        if threshold == 0 || delay == 0 {
+            return Err(GuardianRecoveryError::InvalidConfig);
+        }
+        Ok(Self {
+            active_admin,
+            threshold,
+            delay,
+            initiated_at: env.ledger().sequence(),
+            approvals: Vec::new(env),
+            executed: false,
+            cancelled: false,
+        })
+    }
+
+    /// Records a guardian approval. Caller is responsible for verifying the
+    /// approver holds the Approver role and for auth (require_auth). Approvals
+    /// are deduplicated so a single guardian cannot satisfy the threshold alone.
+    pub fn approve(&mut self, approver: Address) -> Result<(), GuardianRecoveryError> {
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        if !self.approvals.contains(&approver) {
+            self.approvals.push_back(approver);
+        }
+        Ok(())
+    }
+
+    /// Cancels a pending recovery. Only the active administrator may cancel, and
+    /// only while the recovery is still pending (not executed or already cancelled).
+    pub fn cancel(&mut self, caller: &Address) -> Result<(), GuardianRecoveryError> {
+        caller.require_auth();
+        if caller != &self.active_admin {
+            return Err(GuardianRecoveryError::Unauthorized);
+        }
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        self.cancelled = true;
+        Ok(())
+    }
+
+    /// Returns Ok(()) only when the recovery is pending, the guardian threshold
+    /// is met, and the configured delay has fully elapsed since initiation.
+    /// Does not itself perform any state change.
+    pub fn check_executable(&self, env: &Env) -> Result<(), GuardianRecoveryError> {
+        if self.executed {
+            return Err(GuardianRecoveryError::AlreadyExecuted);
+        }
+        if self.cancelled {
+            return Err(GuardianRecoveryError::Cancelled);
+        }
+        if self.approvals.len() < self.threshold {
+            return Err(GuardianRecoveryError::InsufficientApprovals);
+        }
+        let elapsed = env.ledger().sequence().saturating_sub(self.initiated_at);
+        if elapsed < self.delay {
+            return Err(GuardianRecoveryError::DelayNotElapsed);
+        }
+        Ok(())
+    }
+
+    /// Executes the recovery once the threshold and delay guards hold, marking
+    /// it executed so it cannot be replayed.
+    pub fn execute(&mut self, env: &Env) -> Result<(), GuardianRecoveryError> {
+        self.check_executable(env)?;
+        self.executed = true;
         Ok(())
     }
 }

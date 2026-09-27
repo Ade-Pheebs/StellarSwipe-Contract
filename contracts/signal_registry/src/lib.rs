@@ -14,6 +14,11 @@
 //! Expired tombstones may be purged by the admin in bounded, idempotent
 //! batches once the retention window has elapsed.
 //!
+//! Material contract configuration changes emit structured, auditable events
+//! so that indexers and operators can discover them. Each event records the
+//! changed setting, its prior and new values, and the actor that authorized
+//! the change.
+//!
 //! Privileged operations that may be retried after an ambiguous transaction
 //! submission outcome accept an idempotency key. A repeated key never applies
 //! the operation twice: the first successful execution records the key and
@@ -44,7 +49,7 @@
 //! the handoff and become the administrator. Unrelated callers can neither
 //! nominate nor accept, and nomination alone never transfers the role.
 
-use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
+use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Symbol, Vec};
 
 /// Errors returned by the signal registry contract.
 #[contracterror]
@@ -147,6 +152,19 @@ pub struct DataKey {
     pub schedule: DecaySchedule,
 }
 
+/// Auditable event emitted when a material contract configuration setting
+/// changes. Records the changed setting, its prior and new values, and the
+/// actor that authorized the change so indexers and operators can discover
+/// configuration drift.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChanged {
+    pub setting: Symbol,
+    pub old_value: DecaySchedule,
+    pub new_value: DecaySchedule,
+    pub actor: Address,
+}
+
 const ADMIN_KEY: &str = "admin";
 const PENDING_ADMIN_KEY: &str = "pending_admin";
 const SCHEDULE_KEY: &str = "schedule";
@@ -228,7 +246,21 @@ impl SignalRegistry {
         admin.require_auth();
         Self::consume_idempotency_key(&env, &admin, "set_decay_schedule", &idempotency_key)?;
         Self::validate_schedule(&schedule)?;
+        let old_value: DecaySchedule = env
+            .storage()
+            .instance()
+            .get(&SCHEDULE_KEY)
+            .ok_or(SignalError::NotInitialized)?;
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
+        env.events().publish(
+            (Symbol::new(&env, "config_changed"), Symbol::new(&env, "schedule")),
+            ConfigChanged {
+                setting: Symbol::new(&env, "schedule"),
+                old_value,
+                new_value: schedule,
+                actor: admin,
+            },
+        );
         Ok(())
     }
 
@@ -264,4 +296,54 @@ impl SignalRegistry {
     pub fn get_provider_metadata(env: Env, provider: Address) -> Option<String> {
         let key = (
 
-/* … truncated 2587 chars — edit only what you need near the top … */
+    /// Remove a provider's metadata, leaving a tombstone that keeps the
+    /// identifier non-reusable for [`TOMBSTONE_RETENTION_SECONDS`].
+    ///
+    /// Only the provider may remove its own record. Re-removing an already
+    /// tombstoned identifier is idempotent and preserves the original
+    /// retention window.
+    pub fn remove_provider_metadata(env: Env, provider: Address) -> Result<(), SignalError> {
+        provider.require_auth();
+        let key = (METADATA_KEY, provider.clone());
+        env.storage().persistent().remove(&key);
+        let tomb_key = (TOMBSTONE_KEY, provider);
+        if !env.storage().persistent().has(&tomb_key) {
+            let now = env.ledger().timestamp();
+            let tombstone = Tombstone {
+                removed_at: now,
+                expires_at: now.saturating_add(TOMBSTONE_RETENTION_SECONDS),
+            };
+            env.storage().persistent().set(&tomb_key, &tombstone);
+        }
+        Ok(())
+    }
+
+    /// Report the lifecycle state of an identifier: `Active`, `Tombstoned`,
+    /// or `Unknown`.
+    pub fn get_record_state(env: Env, provider: Address) -> RecordState {
+        Self::record_state(&env, &provider)
+    }
+
+    /// Purge expired tombstones in a bounded, idempotent batch.
+    ///
+    /// Only the admin may call this. At most `max_entries` tombstones are
+    /// examined per call, and only those whose retention window has elapsed
+    /// are removed. Re-running is safe: already-purged tombstones are simply
+    /// skipped.
+    pub fn purge_expired_tombstones(
+        env: Env,
+        providers: Vec<Address>,
+        max_entries: u32,
+    ) -> Result<u32, SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        if max_entries == 0 || max_entries > MAX_TOMBSTONE_PURGE {
+            return Err(SignalError::InvalidBatchSize);
+        }
+        let now = env.ledger().timestamp();
+        let mut purged: u32 = 0;
+        for provider in providers
