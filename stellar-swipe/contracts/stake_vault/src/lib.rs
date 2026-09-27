@@ -414,6 +414,16 @@ pub enum StakeVaultError {
     InsufficientTokenAllowance = 45,
     /// A token or cross-contract invocation failed for a reason other than
     /// authorization, balance, or allowance (arithmetic overflow, invalid
+    /// request, a
+    /// The stake token rejected a transfer/burn for insufficient balance
+    /// (distinct from `NoStake`, which means no tracked stake position
+    /// exists at all).
+    InsufficientTokenBalance = 44,
+    /// The stake token rejected a transfer for insufficient/expired
+    /// allowance.
+    InsufficientTokenAllowance = 45,
+    /// A token or cross-contract invocation failed for a reason other than
+    /// authorization, balance, or allowance (arithmetic overflow, invalid
     /// request, an unrecognized custom-token error code, or a host-level
     /// abort). See `shared::token_error` for the classification policy.
     TokenOperationFailed = 46,
@@ -581,6 +591,18 @@ impl From<reward_campaign::CampaignError> for StakeVaultError {
             | E::InvalidClaimWindow
             | E::InvalidRecipients => StakeVaultError::InvalidAmount,
             E::Overflow => StakeVaultError::StakeOverflow,
+        }
+    }
+}
+
+/// Maps the shared token/cross-contract invocation failure classification
+/// (Issue #1001) onto this contract's stable error codes. Every non-success
+/// outcome from a stake-token invocation must flow through here rather than
+/// being treated as `Ok`.
+impl From<shared::TokenFailure> for StakeVaultError {
+    fn from(failure: shared::TokenFailure) -> Self {
+        match failure {
+            shared::TokenFailure::Unauthorized => StakeVaultError::Unauthorized,
         }
     }
 }
