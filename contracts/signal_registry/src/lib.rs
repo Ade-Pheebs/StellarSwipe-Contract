@@ -13,6 +13,36 @@
 //! their identifiers cannot be reused during the documented retention period.
 //! Expired tombstones may be purged by the admin in bounded, idempotent
 //! batches once the retention window has elapsed.
+//!
+//! Privileged operations that may be retried after an ambiguous transaction
+//! submission outcome accept an idempotency key. A repeated key never applies
+//! the operation twice: the first successful execution records the key and
+//! subsequent calls with the same key are rejected with
+//! [`SignalError::IdempotencyKeyReused`].
+//!
+//! ## Idempotency key semantics
+//!
+//! * **Scope** — a key is scoped to the privileged operation that consumed it
+//!   and to the caller that submitted it. The same key value may therefore be
+//!   used independently by different callers or for different operations
+//!   without colliding.
+//! * **Retention** — a consumed key is retained for
+//!   [`IDEMPOTENCY_KEY_RETENTION_SECONDS`] from the ledger timestamp at which
+//!   it was consumed. After that window elapses the key may be reused.
+//! * **Collision behavior** — presenting a key that is still within its
+//!   retention window fails closed with [`SignalError::IdempotencyKeyReused`]
+//!   and leaves state untouched. A key is only recorded once the operation it
+//!   guards has completed successfully, so a failed execution does not consume
+//!   the key and the operation may be retried with the same key.
+//!
+//! ## Two-step administrator handoff
+//!
+//! Administrator replacement is a two-step handoff. The current administrator
+//! nominates a successor with [`SignalRegistry::propose_admin`], which records
+//! the pending administrator without changing the active one. Only the
+//! nominated address may then call [`SignalRegistry::accept_admin`] to complete
+//! the handoff and become the administrator. Unrelated callers can neither
+//! nominate nor accept, and nomination alone never transfers the role.
 
 use soroban_sdk::{contract, contracterror, contractimpl, contracttype, Address, Env, String, Vec};
 
@@ -32,6 +62,9 @@ pub enum SignalError {
     IdentifierTombstoned = 9,
     TombstoneNotExpired = 10,
     InvalidBatchSize = 11,
+    IdempotencyKeyReused = 12,
+    NoPendingAdmin = 13,
+    NotPendingAdmin = 14,
 }
 
 /// Maximum accepted length, in bytes, of provider metadata.
@@ -47,6 +80,10 @@ pub const TOMBSTONE_RETENTION_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 /// Upper bound on the number of expired tombstones purged per cleanup call.
 pub const MAX_TOMBSTONE_PURGE: u32 = 100;
+
+/// Documented retention period, in seconds, during which a consumed
+/// idempotency key remains non-reusable.
+pub const IDEMPOTENCY_KEY_RETENTION_SECONDS: u64 = 24 * 60 * 60;
 
 /// Configuration-driven reputation decay schedule.
 ///
@@ -92,6 +129,17 @@ pub struct Tombstone {
     pub expires_at: u64,
 }
 
+/// Recorded consumption of an idempotency key.
+///
+/// `operation` scopes the key to the privileged operation that consumed it and
+/// `expires_at` bounds how long the key remains non-reusable.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdempotencyRecord {
+    pub operation: String,
+    pub expires_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DataKey {
@@ -100,10 +148,12 @@ pub struct DataKey {
 }
 
 const ADMIN_KEY: &str = "admin";
+const PENDING_ADMIN_KEY: &str = "pending_admin";
 const SCHEDULE_KEY: &str = "schedule";
 const REPUTATION_KEY: &str = "reputation";
 const METADATA_KEY: &str = "metadata";
 const TOMBSTONE_KEY: &str = "tombstone";
+const IDEMPOTENCY_KEY: &str = "idempotency";
 
 #[contract]
 pub struct SignalRegistry;
@@ -121,14 +171,62 @@ impl SignalRegistry {
         Ok(())
     }
 
-    /// Update the decay schedule. Only the admin may call this.
-    pub fn set_decay_schedule(env: Env, schedule: DecaySchedule) -> Result<(), SignalError> {
+    /// Nominate a successor administrator. Only the current administrator may
+    /// call this.
+    ///
+    /// The nomination is recorded as the pending administrator and does **not**
+    /// change the active administrator. The handoff only completes when the
+    /// nominated address calls [`Self::accept_admin`].
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), SignalError> {
         let admin: Address = env
             .storage()
             .instance()
             .get(&ADMIN_KEY)
             .ok_or(SignalError::NotInitialized)?;
         admin.require_auth();
+        env.storage().instance().set(&PENDING_ADMIN_KEY, &new_admin);
+        Ok(())
+    }
+
+    /// Accept a pending administrator nomination, completing the handoff.
+    ///
+    /// Only the address previously nominated via [`Self::propose_admin`] may
+    /// call this. On success the caller becomes the administrator and the
+    /// pending nomination is cleared.
+    pub fn accept_admin(env: Env) -> Result<(), SignalError> {
+        let pending: Address = env
+            .storage()
+            .instance()
+            .get(&PENDING_ADMIN_KEY)
+            .ok_or(SignalError::NoPendingAdmin)?;
+        pending.require_auth();
+        env.storage().instance().set(&ADMIN_KEY, &pending);
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        Ok(())
+    }
+
+    /// Read the currently pending administrator nomination, if any.
+    pub fn get_pending_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&PENDING_ADMIN_KEY)
+    }
+
+    /// Update the decay schedule. Only the admin may call this.
+    ///
+    /// `idempotency_key` makes the call replay-safe: a key that is still within
+    /// its retention window is rejected with [`SignalError::IdempotencyKeyReused`]
+    /// and the schedule is left unchanged.
+    pub fn set_decay_schedule(
+        env: Env,
+        schedule: DecaySchedule,
+        idempotency_key: String,
+    ) -> Result<(), SignalError> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&ADMIN_KEY)
+            .ok_or(SignalError::NotInitialized)?;
+        admin.require_auth();
+        Self::consume_idempotency_key(&env, &admin, "set_decay_schedule", &idempotency_key)?;
         Self::validate_schedule(&schedule)?;
         env.storage().instance().set(&SCHEDULE_KEY, &schedule);
         Ok(())
@@ -164,227 +262,6 @@ impl SignalRegistry {
 
     /// Read the stored metadata for a provider, if any.
     pub fn get_provider_metadata(env: Env, provider: Address) -> Option<String> {
-        let key = (METADATA_KEY, provider);
-        env.storage().persistent().get(&key)
-    }
+        let key = (
 
-    /// Remove a provider's metadata, leaving a tombstone that keeps the
-    /// identifier non-reusable for [`TOMBSTONE_RETENTION_SECONDS`].
-    ///
-    /// Only the provider may remove its own record. Re-removing an already
-    /// tombstoned identifier is idempotent and preserves the original
-    /// retention window.
-    pub fn remove_provider_metadata(env: Env, provider: Address) -> Result<(), SignalError> {
-        provider.require_auth();
-        let key = (METADATA_KEY, provider.clone());
-        env.storage().persistent().remove(&key);
-        let tomb_key = (TOMBSTONE_KEY, provider);
-        if !env.storage().persistent().has(&tomb_key) {
-            let now = env.ledger().timestamp();
-            let tombstone = Tombstone {
-                removed_at: now,
-                expires_at: now.saturating_add(TOMBSTONE_RETENTION_SECONDS),
-            };
-            env.storage().persistent().set(&tomb_key, &tombstone);
-        }
-        Ok(())
-    }
-
-    /// Report the lifecycle state of an identifier: `Active`, `Tombstoned`,
-    /// or `Unknown`.
-    pub fn get_record_state(env: Env, provider: Address) -> RecordState {
-        Self::record_state(&env, &provider)
-    }
-
-    /// Purge expired tombstones in a bounded, idempotent batch.
-    ///
-    /// Only the admin may call this. At most `max_entries` tombstones are
-    /// examined per call, and only those whose retention window has elapsed
-    /// are removed. Re-running is safe: already-purged tombstones are simply
-    /// skipped.
-    pub fn purge_expired_tombstones(
-        env: Env,
-        providers: Vec<Address>,
-        max_entries: u32,
-    ) -> Result<u32, SignalError> {
-        let admin: Address = env
-            .storage()
-            .instance()
-            .get(&ADMIN_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        admin.require_auth();
-        if max_entries == 0 || max_entries > MAX_TOMBSTONE_PURGE {
-            return Err(SignalError::InvalidBatchSize);
-        }
-        let now = env.ledger().timestamp();
-        let mut purged: u32 = 0;
-        for provider in providers.iter() {
-            if purged >= max_entries {
-                break;
-            }
-            let tomb_key = (TOMBSTONE_KEY, provider.clone());
-            if let Some(tombstone) = env
-                .storage()
-                .persistent()
-                .get::<(_, Address), Tombstone>(&tomb_key)
-            {
-                if now >= tombstone.expires_at {
-                    env.storage().persistent().remove(&tomb_key);
-                    purged += 1;
-                }
-            }
-        }
-        Ok(purged)
-    }
-
-    /// Apply a reputation update for a provider, first decaying the stored
-    /// score according to the configured schedule.
-    pub fn update_reputation(
-        env: Env,
-        provider: Address,
-        delta: i128,
-    ) -> Result<i128, SignalError> {
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-
-        let now = env.ledger().timestamp();
-        let record = Self::load_reputation(&env, &provider);
-
-        // Decay the existing score based on elapsed time since last update.
-        let decayed = Self::apply_decay(&record, now, &schedule);
-
-        // Apply the new delta and clamp to configured thresholds.
-        let updated = Self::clamp(decayed.saturating_add(delta), &schedule);
-
-        let new_record = ReputationRecord {
-            score: updated,
-            last_updated: now,
-        };
-        Self::store_reputation(&env, &provider, &new_record);
-        Ok(updated)
-    }
-
-    /// Read the current (decayed) reputation for a provider without mutating
-    /// state. Useful for off-chain verification and contract tests.
-    pub fn get_reputation(env: Env, provider: Address) -> Result<i128, SignalError> {
-        let schedule: DecaySchedule = env
-            .storage()
-            .instance()
-            .get(&SCHEDULE_KEY)
-            .ok_or(SignalError::NotInitialized)?;
-        let record = Self::load_reputation(&env, &provider);
-        let now = env.ledger().timestamp();
-        Ok(Self::apply_decay(&record, now, &schedule))
-    }
-
-    /// Classify an identifier as active, tombstoned, or unknown.
-    ///
-    /// A tombstone whose retention window has elapsed is treated as unknown,
-    /// so the identifier becomes reusable once the documented period passes.
-    fn record_state(env: &Env, provider: &Address) -> RecordState {
-        let meta_key = (METADATA_KEY, provider.clone());
-        if env.storage().persistent().has(&meta_key) {
-            return RecordState::Active;
-        }
-        let tomb_key = (TOMBSTONE_KEY, provider.clone());
-        if let Some(tombstone) = env
-            .storage()
-            .persistent()
-            .get::<(_, Address), Tombstone>(&tomb_key)
-        {
-            if env.ledger().timestamp() < tombstone.expires_at {
-                return RecordState::Tombstoned;
-            }
-        }
-        RecordState::Unknown
-    }
-
-    /// Compute the decayed score for a record at a given timestamp.
-    ///
-    /// Deterministic: depends only on the stored record, the timestamp, and
-    /// the configured schedule.
-    fn apply_decay(record: &ReputationRecord, now: u64, schedule: &DecaySchedule) -> i128 {
-        if now <= record.last_updated {
-            return record.score;
-        }
-        let elapsed = now - record.last_updated;
-        if elapsed <= schedule.grace_period {
-            return record.score;
-        }
-        let decayable = elapsed - schedule.grace_period;
-        if schedule.decay_interval == 0 {
-            return record.score;
-        }
-        let intervals = decayable / schedule.decay_interval;
-        if intervals == 0 {
-            return record.score;
-        }
-        // Points lost = score * rate_bps * intervals / 10_000, computed with
-        // saturating arithmetic to remain deterministic on-chain.
-        let rate = schedule.decay_rate_bps as i128;
-        let lost = record
-            .score
-            .saturating_mul(rate)
-            .saturating_mul(intervals as i128)
-            / 10_000;
-        let decayed = record.score.saturating_sub(lost);
-        Self::clamp(decayed, schedule)
-    }
-
-    /// Clamp a reputation value to the configured thresholds.
-    fn clamp(value: i128, schedule: &DecaySchedule) -> i128 {
-        if value < schedule.min_reputation {
-            schedule.min_reputation
-        } else if value > schedule.max_reputation {
-            schedule.max_reputation
-        } else {
-            value
-        }
-    }
-
-    /// Validate a decay schedule before it is stored or applied.
-    fn validate_schedule(schedule: &DecaySchedule) -> Result<(), SignalError> {
-        if schedule.decay_rate_bps > 10_000 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.decay_interval == 0 {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        if schedule.min_reputation > schedule.max_reputation {
-            return Err(SignalError::InvalidDecayConfig);
-        }
-        Ok(())
-    }
-
-    /// Validate provider metadata before it is stored.
-    fn validate_metadata(metadata: &String) -> Result<(), SignalError> {
-        if metadata.len() == 0 {
-            return Err(SignalError::EmptyMetadata);
-        }
-        if metadata.len() > MAX_METADATA_LEN {
-            return Err(SignalError::MetadataTooLong);
-        }
-        Ok(())
-    }
-
-    /// Load the stored reputation record for a provider, defaulting to zero.
-    fn load_reputation(env: &Env, provider: &Address) -> ReputationRecord {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage()
-            .persistent()
-            .get(&key)
-            .unwrap_or(ReputationRecord {
-                score: 0,
-                last_updated: env.ledger().timestamp(),
-            })
-    }
-
-    /// Persist a reputation record for a provider.
-    fn store_reputation(env: &Env, provider: &Address, record: &ReputationRecord) {
-        let key = (REPUTATION_KEY, provider.clone());
-        env.storage().persistent().set(&key, record);
-    }
-}
+/* … truncated 2587 chars — edit only what you need near the top … */
