@@ -19,3 +19,6 @@
 
 <!-- handsoff-issue-1170 -->
 - #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1188 -->
+- #1188: Reject stale pagination cursors after relevant state changes
