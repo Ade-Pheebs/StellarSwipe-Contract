@@ -5,6 +5,7 @@
 //! Also provides a shared append-only emergency action journal (#1166).
 //! Also provides delayed guardian recovery for lost administrator access (#1183).
 //! Also provides scoped operator capabilities for contract maintenance actions (#1182).
+//! Also defines cancellation rules for queued governance timelock actions (#1210).
 //! Also provides safe overlap during bridge validator-set rotation (#1218).
 //! Follow-up work: wire into the live pause-handling contract storage/auth and add
 //! integration tests against real contract state.
@@ -198,6 +199,124 @@ impl GuardianRecovery {
     }
 }
 
+/// Lifecycle states a queued governance timelock action can occupy (#1210).
+///
+/// Cancellation is only permitted from `Queued`; once an action is `Executed`
+/// or `Cancelled` it is terminal and can never be executed later.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[contracttype]
+pub enum TimelockState {
+    /// Waiting out the timelock delay; the only cancellable state.
+    Queued,
+    /// The timelock delay has elapsed and the action may be executed.
+    Ready,
+    /// The action has been executed; terminal.
+    Executed,
+    /// The action was cancelled; terminal and never executable.
+    Cancelled,
+}
+
+/// Errors surfaced by the governance timelock cancellation path (#1210).
+#[derive(Debug, PartialEq, Eq)]
+pub enum TimelockError {
+    /// Caller is not authorized to cancel this action.
+    Unauthorized,
+    /// The action is not in a state from which cancellation is allowed.
+    NotCancellable,
+    /// The action has already been executed and can never be cancelled.
+    AlreadyExecuted,
+    /// The action has already been cancelled.
+    AlreadyCancelled,
+    /// The action was cancelled and can never be executed.
+    Cancelled,
+    /// The configured timelock delay has not yet elapsed.
+    DelayNotElapsed,
+}
+
+/// A queued governance action subject to a timelock delay (#1210).
+///
+/// Cancellation authority: only the `governance_admin` (the governance authority
+/// that queued the action) may cancel. Cancellation is allowed only while the
+/// action is `Queued`; `Executed` and `Cancelled` are terminal states. A
+/// cancelled action can never be executed later because `check_executable`
+/// rejects the `Cancelled` state before any execution can occur.
+#[derive(Clone)]
+#[contracttype]
+pub struct TimelockAction {
+    /// The governance authority that queued the action and may cancel it.
+    pub governance_admin: Address,
+    /// Delay (in ledgers) that must elapse between queuing and execution.
+    pub delay: u32,
+    /// Ledger sequence at which the action was queued.
+    pub queued_at: u32,
+    /// Current lifecycle state of the action.
+    pub state: TimelockState,
+}
+
+impl TimelockAction {
+    /// Queues a new governance action. Rejects a zero delay so a misconfigured
+    /// action cannot bypass the timelock.
+    pub fn new(
+        governance_admin: Address,
+        delay: u32,
+        env: &Env,
+    ) -> Result<Self, TimelockError> {
+        if delay == 0 {
+            return Err(TimelockError::NotCancellable);
+        }
+        Ok(Self {
+            governance_admin,
+            delay,
+            queued_at: env.ledger().sequence(),
+            state: TimelockState::Queued,
+        })
+    }
+
+    /// Cancels a queued governance action. Only the governance admin may cancel,
+    /// and only while the action is still `Queued`. Executed or already-cancelled
+    /// actions are rejected so cancellation cannot corrupt terminal state.
+    pub fn cancel(&mut self, caller: &Address) -> Result<(), TimelockError> {
+        caller.require_auth();
+        if caller != &self.governance_admin {
+            return Err(TimelockError::Unauthorized);
+        }
+        match self.state {
+            TimelockState::Queued => {
+                self.state = TimelockState::Cancelled;
+                Ok(())
+            }
+            TimelockState::Executed => Err(TimelockError::AlreadyExecuted),
+            TimelockState::Cancelled => Err(TimelockError::AlreadyCancelled),
+            TimelockState::Ready => Err(TimelockError::NotCancellable),
+        }
+    }
+
+    /// Returns Ok(()) only when the action is still queued/ready and the timelock
+    /// delay has fully elapsed. A cancelled action is always rejected, so it can
+    /// never be executed later.
+    pub fn check_executable(&self, env: &Env) -> Result<(), TimelockError> {
+        match self.state {
+            TimelockState::Cancelled => return Err(TimelockError::Cancelled),
+            TimelockState::Executed => return Err(TimelockError::AlreadyExecuted),
+            TimelockState::Queued | TimelockState::Ready => {}
+        }
+        let elapsed = env.ledger().sequence().saturating_sub(self.queued_at);
+        if elapsed < self.delay {
+            return Err(TimelockError::DelayNotElapsed);
+        }
+        Ok(())
+    }
+
+    /// Executes the action once the timelock delay has elapsed, marking it
+    /// executed so it cannot be replayed. Cancelled actions are rejected by
+    /// `check_executable` and can never reach this state change.
+    pub fn execute(&mut self, env: &Env) -> Result<(), TimelockError> {
+        self.check_executable(env)?;
+        self.state = TimelockState::Executed;
+        Ok(())
+    }
+}
+
 /// Errors surfaced by the bridge validator-set rotation path (#1218).
 #[derive(Debug, PartialEq, Eq)]
 pub enum ValidatorSetError {
@@ -288,6 +407,9 @@ impl ValidatorSetRotation {
         if now >= self.effective_retired_at() {
             return Err(ValidatorSetError::AlreadyRetired);
         }
+        Ok(())
+    }
+}
         Ok(())
     }
 }
