@@ -19,3 +19,6 @@
 
 <!-- handsoff-issue-1170 -->
 - #1170: Add Soroban authorization payload size regression tests
+
+<!-- handsoff-issue-1187 -->
+- #1187: Authenticate pagination cursors against contract and query scope
